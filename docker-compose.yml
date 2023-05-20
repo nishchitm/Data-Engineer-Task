@@ -12,6 +12,8 @@ services:
       MYSQL_PASSWORD: nonroot
     ports:
       - 3306:3306
+    volumes:
+      - ./analytics:/app/analytics
 
   psql_db:
     image: "postgres:9.5.15"
@@ -22,26 +24,28 @@ services:
       POSTGRES_DB: main
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: password
+    ports:
+      - 5433:5432
 
   main:
     build:
       context: main
     environment:
-      POSTGRESQL_CS: 'postgresql+psycopg2://postgres:password@psql_db:5432/main'
+      POSTGRESQL_CS: 'postgresql+psycopg2://postgres:password@psql_db:5433/main'
     depends_on:
       - psql_db
     command: ["python", "./main.py" ]
-  
+
   analytics:
     build:
       context: analytics
     environment:
-      POSTGRESQL_CS: 'postgresql+psycopg2://postgres:password@psql_db:5432/main'
+      POSTGRESQL_CS: 'postgresql+psycopg2://postgres:password@psql_db:5433/main'
       MYSQL_CS: 'mysql+pymysql://nonroot:nonroot@mysql_db:3306/analytics?charset=utf8'
-
+    volumes:
+      - ./analytics:/app/analytics
     depends_on:
       - mysql_db
       - psql_db
       - main
     command: ["python", "./analytics.py" ]
-    
