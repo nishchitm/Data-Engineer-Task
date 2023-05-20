@@ -34,7 +34,11 @@ async def etl_task():
     while True:
         # Pull data from PostgreSQL
         psql_conn = psql_engine.connect()
-        psql_query = text("SELECT device_id, time, temperature, location FROM devices")
+        psql_query = text("""
+            SELECT device_id, temperature, location, time
+            FROM devices
+            WHERE CAST(time AS TIMESTAMP) >= NOW() - INTERVAL '1 HOUR'
+        """)
         psql_result = psql_conn.execute(psql_query).fetchall()
         psql_conn.close()
 
@@ -54,7 +58,17 @@ async def etl_task():
             distance = 0
             if device_id in aggregated_data:
                 last_lat, last_lon = aggregated_data[device_id]['last_location']
-                distance = geodesic((last_lat, last_lon), (latitude, longitude)).kilometers
+
+            if device_id in aggregated_data:
+                last_lat, last_lon = aggregated_data[device_id]['last_location']
+                last_lat = math.radians(last_lat)
+                last_lon = math.radians(last_lon)
+                distance = math.acos(
+                    math.sin(last_lat) * math.sin(latitude) +
+                    math.cos(last_lat) * math.cos(latitude) * math.cos(longitude - last_lon)
+                ) * 6371
+                
+                # distance = geodesic((last_lat, last_lon), (latitude, longitude)).kilometers           # Another method to calculate the distance
 
             if device_id not in aggregated_data:
                 aggregated_data[device_id] = {
@@ -72,7 +86,7 @@ async def etl_task():
         # Store aggregated data into MySQL
         mysql_conn = mysql_engine.connect()
         mysql_conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS aggregated_data (
+            CREATE TABLE IF NOT EXISTS analytics (
                 device_id VARCHAR(36) NOT NULL,
                 timestamp TIMESTAMP NOT NULL,
                 max_temperature INTEGER,
