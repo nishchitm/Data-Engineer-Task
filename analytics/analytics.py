@@ -1,12 +1,12 @@
 import json
 import math
+import asyncio
 from os import environ
 from time import sleep
 from sqlalchemy import create_engine
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.sql import text
 from geopy.distance import geodesic
-
-
 
 print('Waiting for the data generator...')
 sleep(20)
@@ -30,83 +30,68 @@ while True:
         sleep(0.1)
 print('Connection to MySQL successful.')
 
-def calculate_distance(location1, location2):
-    lat1, lon1 = json.loads(location1).values()
-    lat2, lon2 = json.loads(location2).values()
-    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
-    distance = geodesic((lat1, lon1), (lat2, lon2)).kilometers
-    return distance
+async def etl_task():
+    while True:
+        # Pull data from PostgreSQL
+        psql_conn = psql_engine.connect()
+        psql_query = text("SELECT device_id, time, temperature, location FROM devices")
+        psql_result = psql_conn.execute(psql_query).fetchall()
+        psql_conn.close()
 
-with mysql_engine.connect() as conn:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS max_temperatures (
-            device_id VARCHAR(255) NOT NULL,
-            hour TIMESTAMP NOT NULL,
-            max_temperature INTEGER,
-            PRIMARY KEY (device_id, hour)
-        )
-        """
-    )
+       # Perform data transformations and aggregations
+        aggregated_data = {}
+        for row in psql_result:
+            device_id = str(row['device_id'])
+            timestamp = row['time']
+            temperature = row['temperature']
+            location = json.loads(row['location'])
 
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS data_points_count (
-            device_id VARCHAR(255) NOT NULL,
-            hour TIMESTAMP NOT NULL,
-            count INTEGER,
-            PRIMARY KEY (device_id, hour)
-        )
-        """
-    )
+            # Extract latitude and longitude from the location
+            latitude = location['latitude']
+            longitude = location['longitude']
 
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS total_distance (
-            device_id VARCHAR(255) NOT NULL,
-            hour TIMESTAMP NOT NULL,
-            distance FLOAT,
-            PRIMARY KEY (device_id, hour)
-        )
-        """
-    )
+            # Calculate distance
+            distance = 0
+            if device_id in aggregated_data:
+                last_lat, last_lon = aggregated_data[device_id]['last_location']
+                distance = geodesic((last_lat, last_lon), (latitude, longitude)).kilometers
 
-while True:
-    try:
-        with mysql_engine.connect() as mysql_conn, psql_engine.connect() as psql_conn:
-            # Calculate and store maximum temperatures
-            max_temps_query = """
-            INSERT INTO max_temperatures (device_id, hour, max_temperature)
-            SELECT device_id, date_trunc('hour', time) as hour, max(temperature)
-            FROM devices
-            GROUP BY device_id, hour
-            ON DUPLICATE KEY UPDATE max_temperature = VALUES(max_temperature)
-            """
-            mysql_conn.execute(max_temps_query)
+            if device_id not in aggregated_data:
+                aggregated_data[device_id] = {
+                    'last_location': (latitude, longitude),
+                    'max_temperature': temperature,
+                    'data_points': 1,
+                    'total_distance': distance
+                }
+            else:
+                aggregated_data[device_id]['last_location'] = (latitude, longitude)
+                aggregated_data[device_id]['max_temperature'] = max(aggregated_data[device_id]['max_temperature'], temperature)
+                aggregated_data[device_id]['data_points'] += 1
+                aggregated_data[device_id]['total_distance'] += distance
 
-            # Calculate and store data points count
-            count_query = """
-            INSERT INTO data_points_count (device_id, hour, count)
-            SELECT device_id, date_trunc('hour', time) as hour, count(*)
-            FROM devices
-            GROUP BY device_id, hour
-            ON DUPLICATE KEY UPDATE count = VALUES(count)
-            """
-            mysql_conn.execute(count_query)
+        # Store aggregated data into MySQL
+        mysql_conn = mysql_engine.connect()
+        mysql_conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS aggregated_data (
+                device_id VARCHAR(36) NOT NULL,
+                timestamp TIMESTAMP NOT NULL,
+                max_temperature INTEGER,
+                data_points INTEGER,
+                total_distance FLOAT,
+                PRIMARY KEY (device_id, timestamp)
+            )
+        """))
 
-            # Calculate and store total distance
-            distance_query = """
-            INSERT INTO total_distance (device_id, hour, distance)
-            SELECT d1.device_id, date_trunc('hour', d1.time) as hour,
-                SUM(calculate_distance(d1.location, d2.location))
-            FROM devices d1
-            INNER JOIN devices d2
-            ON d1.device_id = d2.device_id
-            AND d1.time > d2.time
-            GROUP BY d1.device_id, hour
-            ON DUPLICATE KEY UPDATE distance = VALUES(distance)
-            """
-            mysql_conn.execute(distance_query)
+        for device_id, data in aggregated_data.items():
+            mysql_conn.execute(text("""
+                INSERT INTO analytics (device_id, timestamp, max_temperature, data_points, total_distance)
+                VALUES (:device_id, :timestamp, :max_temperature, :data_points, :total_distance)
+            """), device_id=device_id, timestamp=timestamp, max_temperature=data['max_temperature'],
+               data_points=data['data_points'], total_distance=data['total_distance'])
 
-    except OperationalError:
-        sleep(0.1)
+        mysql_conn.close()
+
+        await asyncio.sleep(3600)  # Run the task every hour
+
+loop = asyncio.get_event_loop()
+loop.run_until_complete(etl_task())
